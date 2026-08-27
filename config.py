@@ -24,9 +24,15 @@ DEVICE = "cpu"                  # RPi4 has no CUDA GPU
 # ---------------------------------------------------------------------------
 # Camera
 # ---------------------------------------------------------------------------
+# The deployment camera's resolution and aspect ratio are NOT known ahead of
+# time (could be a portrait phone clip, a landscape webcam, a square RTSP
+# feed, etc.), so there is no fixed FRAME_WIDTH/FRAME_HEIGHT here. Instead,
+# main.py reads the real source dimensions at runtime and derives a
+# processing size that preserves the source's native aspect ratio - it only
+# ever scales down uniformly, capped by PROCESSING_MAX_DIMENSION, and never
+# stretches/distorts. See main.py's compute_processing_size().
 CAMERA_SOURCE = "data/sample.mp4"                # 0 = default USB camera, or RTSP/file path
-FRAME_WIDTH = 474
-FRAME_HEIGHT = 850
+PROCESSING_MAX_DIMENSION = 640   # cap on the longer edge after aspect-preserving resize (RPi4 perf knob)
 FRAME_SKIP = 2                   # run inference every Nth frame to save CPU
 DISPLAY_WINDOW = True            # False for headless deployment (systemd service)
 
@@ -41,13 +47,18 @@ REACQUIRE_WINDOW = 10            # frames within which a lost track is eligible 
 REACQUIRE_IOU_RATIO = 0.5        # lenient re-match IOU threshold = IOU_MATCH_THRESHOLD * this ratio
 
 # ---------------------------------------------------------------------------
-# Virtual line for entry/exit counting (pixel coords of resized frame)
-# NOTE: If entries/exits report as reversed, swap LINE_START/END or invert
-# the sign check in cv/counter.py — this depends on camera mounting.
+# Virtual line for entry/exit counting, expressed as FRACTIONS (0.0-1.0) of
+# the actual runtime processing frame width/height - not absolute pixels -
+# so the line geometry is meaningful regardless of the source's resolution
+# or aspect ratio. main.py converts these to concrete pixel coordinates once
+# it knows the real processing frame size for this run.
+# NOTE: If entries/exits report as reversed, swap LINE_START_FRACTION/
+# LINE_END_FRACTION or invert the sign check in counter.py — this depends on
+# camera mounting.
 # ---------------------------------------------------------------------------
-LINE_START = (0, FRAME_HEIGHT // 2)
-LINE_END = (FRAME_WIDTH, FRAME_HEIGHT // 2)
-LINE_MARGIN = 8.0                # dead-zone (px) around the line to prevent jitter double-counts
+LINE_START_FRACTION = (0.0, 0.5)   # default: horizontal line across the frame's mid-height
+LINE_END_FRACTION = (1.0, 0.5)
+LINE_MARGIN_FRACTION = 0.015       # dead-zone as a fraction of min(processing_w, processing_h)
 
 # ---------------------------------------------------------------------------
 # Heatmap
