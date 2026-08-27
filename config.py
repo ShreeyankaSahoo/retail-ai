@@ -42,7 +42,7 @@ DISPLAY_WINDOW = True            # False for headless deployment (systemd servic
 MAX_TRACK_AGE = 90               # frames a lost track survives before deletion (validated during Phase 2 tracking tests)
 MIN_HITS = 3                     # frames required before a track is "confirmed"
 IOU_MATCH_THRESHOLD = 0.3
-MAX_MISSED_FOR_DISPLAY = 3       # consecutive missed frames a confirmed track may still be reported for
+MAX_MISSED_FOR_DISPLAY = 4      # consecutive missed frames a confirmed track may still be reported for
 REACQUIRE_WINDOW = 10            # frames within which a lost track is eligible for lenient re-matching
 REACQUIRE_IOU_RATIO = 0.5        # lenient re-match IOU threshold = IOU_MATCH_THRESHOLD * this ratio
 
