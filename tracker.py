@@ -70,8 +70,26 @@ class KalmanBoxTracker:
             [0, 0, 1, 0, 0, 0, 0],
             [0, 0, 0, 1, 0, 0, 0],
         ], dtype=np.float32)
-        self.kf.processNoiseCov = np.eye(7, dtype=np.float32) * 1.0
-        self.kf.processNoiseCov[4:, 4:] *= 0.01  # velocity components change slowly
+
+        # Process noise, tuned per-component (validated in Phase 2 Colab testing
+        # against real footage — replaces the earlier uniform eye(7)*1.0, which
+        # assumed position, scale AND aspect ratio all barely change frame-to-
+        # frame. That's a poor fit for people turning/posing: scale and aspect
+        # ratio can shift a lot while position stays put. Position keeps modest
+        # noise; scale (s) and aspect ratio (r) get much more room to move;
+        # velocity terms react a bit faster to real direction changes than the
+        # old x0.01 damping did.
+        process_noise_diag = np.array([
+            25.0,     # cx  (position - modest)
+            25.0,     # cy  (position - modest)
+            2500.0,   # s   (area - large, pose/turn changes this a lot)
+            0.05,     # r   (aspect ratio - meaningfully larger than before)
+            2.5,      # vcx (velocity)
+            2.5,      # vcy
+            250.0,    # vs
+        ], dtype=np.float32)
+        self.kf.processNoiseCov = np.diag(process_noise_diag)
+
         self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1.0
         self.kf.errorCovPost = np.eye(7, dtype=np.float32) * 10.0
 
@@ -107,10 +125,32 @@ class KalmanBoxTracker:
 class Tracker:
     """SORT-style multi-object tracker managing a pool of KalmanBoxTracker instances."""
 
-    def __init__(self, max_age: int = 30, min_hits: int = 3, iou_threshold: float = 0.3):
+    def __init__(
+        self,
+        max_age: int = 30,
+        min_hits: int = 3,
+        iou_threshold: float = 0.3,
+        max_missed_for_display: int = 3,
+        reacquire_window: int = 10,
+        reacquire_iou_ratio: float = 0.5,
+    ):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
+
+        # How many consecutive missed frames a track may have and still be
+        # reported in results (using its predicted bbox). Keeps a briefly-
+        # missed-but-alive track visible instead of it disappearing from the
+        # output for 1-2 frames at a time.
+        self.max_missed_for_display = max_missed_for_display
+
+        # Second-chance re-association window/threshold. Only tracks missed
+        # for <= reacquire_window frames are eligible for lenient re-matching
+        # (kept short on purpose - reviving very stale tracks risks merging
+        # in a different, later person instead).
+        self.reacquire_window = reacquire_window
+        self.reacquire_iou_ratio = reacquire_iou_ratio
+
         self.trackers: List[KalmanBoxTracker] = []
 
     def update(self, detections: List[Tuple[List[float], float]]) -> List[Dict]:
@@ -123,10 +163,18 @@ class Tracker:
         det_boxes = [d[0] for d in detections]
         predicted_boxes = [t.predict() for t in self.trackers]
 
-        matches, unmatched_dets, _ = self._associate(predicted_boxes, det_boxes)
+        matches, unmatched_dets, unmatched_trks = self._associate(predicted_boxes, det_boxes)
 
         for trk_idx, det_idx in matches:
             self.trackers[trk_idx].update(det_boxes[det_idx])
+
+        # Give detections that failed the strict primary match a second
+        # chance against tracks that were only just lost, using a more
+        # lenient threshold. A hit here re-binds the SAME existing track/id
+        # instead of spawning a duplicate.
+        unmatched_dets = self._reacquire_lost_tracks(
+            unmatched_dets, det_boxes, unmatched_trks, predicted_boxes
+        )
 
         for det_idx in unmatched_dets:
             self.trackers.append(KalmanBoxTracker(det_boxes[det_idx]))
@@ -134,9 +182,16 @@ class Tracker:
         # Drop tracks that have been lost for too long
         self.trackers = [t for t in self.trackers if t.time_since_update <= self.max_age]
 
+        # A track is reported if it's "confirmed" AND has been missed for no
+        # more than max_missed_for_display frames (previously required
+        # time_since_update == 0, i.e. matched on this exact frame). Confirmed
+        # status uses cumulative hits (not hit_streak) so a track that was
+        # just reacquired after an occlusion doesn't have to rebuild a fresh
+        # streak from zero to stay reported.
         results = []
         for t in self.trackers:
-            if t.time_since_update == 0 and (t.hit_streak >= self.min_hits or t.age <= self.min_hits):
+            is_confirmed = t.hits >= self.min_hits or t.age <= self.min_hits
+            if is_confirmed and t.time_since_update <= self.max_missed_for_display:
                 results.append({"id": t.id, "bbox": t.get_state()})
         return results
 
@@ -174,6 +229,60 @@ class Tracker:
         unmatched_trks = [i for i in range(len(predicted_boxes)) if i not in used_trks]
         unmatched_dets = [i for i in range(len(det_boxes)) if i not in used_dets]
         return matches, unmatched_dets, unmatched_trks
+
+    def _reacquire_lost_tracks(self, unmatched_dets, det_boxes, unmatched_trks, predicted_boxes):
+        """
+        Second-chance association pass, run AFTER the primary strict IOU
+        match. Targets detections the primary pass could not match, and
+        tries a more lenient overlap check against tracks that were only
+        recently lost (time_since_update within reacquire_window).
+
+        This prevents the common failure mode where a brief miss combined
+        with a small movement/pose change drops the primary IOU just below
+        iou_threshold, which would otherwise spawn a duplicate track for a
+        person whose original track is still alive.
+
+        Recovered detections re-bind to the SAME existing track (preserving
+        its id) rather than creating a new KalmanBoxTracker.
+        """
+        if not unmatched_dets or not unmatched_trks:
+            return unmatched_dets
+
+        eligible_trks = [
+            t_idx for t_idx in unmatched_trks
+            if 1 <= self.trackers[t_idx].time_since_update <= self.reacquire_window
+        ]
+        if not eligible_trks:
+            return unmatched_dets
+
+        lenient_threshold = self.iou_threshold * self.reacquire_iou_ratio
+
+        pairs = sorted(
+            (
+                (compute_iou(predicted_boxes[t_idx], det_boxes[d_idx]), t_idx, d_idx)
+                for t_idx in eligible_trks
+                for d_idx in unmatched_dets
+            ),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+
+        used_trks, used_dets = set(), set()
+        for iou_val, t_idx, d_idx in pairs:
+            if iou_val < lenient_threshold:
+                break
+            if t_idx in used_trks or d_idx in used_dets:
+                continue
+            missed_frames = self.trackers[t_idx].time_since_update
+            self.trackers[t_idx].update(det_boxes[d_idx])
+            used_trks.add(t_idx)
+            used_dets.add(d_idx)
+            logger.debug(
+                f"Re-acquired track {self.trackers[t_idx].id} after "
+                f"{missed_frames} missed frame(s) (lenient IOU={iou_val:.3f})"
+            )
+
+        return [d for d in unmatched_dets if d not in used_dets]
 
     def get_active_count(self) -> int:
         """Number of tracks currently matched to a detection this frame."""
