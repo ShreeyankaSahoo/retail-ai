@@ -9,6 +9,17 @@ tunable. It intentionally does NOT do SQLite persistence or serve an API yet
 - those are later steps. Where the pipeline would hand off to the database,
 that call is a clearly-marked no-op for now (see _log_to_database_stub).
 
+Resolution/aspect-ratio independence: the deployment camera's resolution and
+aspect ratio are not known ahead of time, so this pipeline never assumes a
+fixed frame size. It reads the real source dimensions from the first frame,
+derives a processing size that preserves the source's native aspect ratio
+(uniform downscale only, capped by config.PROCESSING_MAX_DIMENSION - see
+compute_processing_size()), and derives the counting-line geometry and
+heatmap dimensions from that same runtime-computed size (config.py stores
+the line as fractions of frame width/height, not absolute pixels). Detector,
+tracker, counter, and heatmap all then operate in that one consistent
+coordinate space for the whole run.
+
 Usage:
     python main.py --source path/to/video.mp4
     python main.py --source path/to/video.mp4 --output annotated.mp4 --no-display
@@ -40,8 +51,37 @@ def _log_to_database_stub(stats: dict) -> None:
     pass
 
 
-def build_pipeline():
-    """Constructs the four pipeline stages from config.py values."""
+def compute_processing_size(native_w: int, native_h: int, max_dimension: int) -> tuple:
+    """
+    Derives an aspect-ratio-preserving processing size from the source's real
+    dimensions. Scales both dimensions by the SAME factor (so it can only
+    ever uniformly shrink, never stretch/distort), capped so the longer edge
+    never exceeds max_dimension. Never upscales a source smaller than the cap.
+
+    Each dimension is then rounded DOWN to the nearest even number. Odd
+    frame dimensions cause some video codecs (e.g. mp4v, used for the
+    annotated output video) to silently coerce the width/height by 1px on
+    write, so the actual saved video ends up a different size than what was
+    requested. Rounding here keeps every stage of the pipeline (detector,
+    tracker, counter, heatmap, and the output video writer) using the exact
+    same dimensions throughout - no downstream size mismatch.
+
+    Returns (processing_w, processing_h), each an even number >= 2.
+    """
+    scale = min(1.0, max_dimension / max(native_w, native_h))
+    processing_w = max(1, round(native_w * scale))
+    processing_h = max(1, round(native_h * scale))
+    processing_w -= processing_w % 2
+    processing_h -= processing_h % 2
+    processing_w = max(2, processing_w)
+    processing_h = max(2, processing_h)
+    return processing_w, processing_h
+
+
+def build_pipeline(line_start, line_end, line_margin, heatmap_width, heatmap_height):
+    """Constructs the four pipeline stages. Detector/tracker come straight from
+    config.py; the counter's line and the heatmap's dimensions are passed in
+    because they depend on this run's runtime-computed processing size."""
     detector = PersonDetector(
         model_path=config.MODEL_PATH,
         conf_threshold=config.CONFIDENCE_THRESHOLD,
@@ -59,13 +99,13 @@ def build_pipeline():
         reacquire_iou_ratio=config.REACQUIRE_IOU_RATIO,
     )
     line_counter = LineCounter(
-        line_start=config.LINE_START,
-        line_end=config.LINE_END,
-        margin=config.LINE_MARGIN,
+        line_start=line_start,
+        line_end=line_end,
+        margin=line_margin,
     )
     heatmap_gen = HeatmapGenerator(
-        width=config.FRAME_WIDTH,
-        height=config.FRAME_HEIGHT,
+        width=heatmap_width,
+        height=heatmap_height,
         blur_kernel_size=config.HEATMAP_BLUR_KERNEL,
         point_radius=config.HEATMAP_POINT_RADIUS,
         decay_factor=config.HEATMAP_DECAY,
@@ -73,7 +113,7 @@ def build_pipeline():
     return detector, tracker, line_counter, heatmap_gen
 
 
-def draw_overlay(frame, tracks, line_counter_stats):
+def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end):
     """Draws track boxes/IDs, the counting line, and running stats onto frame (in place)."""
     for t in tracks:
         x1, y1, x2, y2 = [int(v) for v in t["bbox"]]
@@ -83,8 +123,8 @@ def draw_overlay(frame, tracks, line_counter_stats):
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
         )
 
-    ls = tuple(int(v) for v in config.LINE_START)
-    le = tuple(int(v) for v in config.LINE_END)
+    ls = tuple(int(v) for v in line_start)
+    le = tuple(int(v) for v in line_end)
     cv2.line(frame, ls, le, (0, 0, 255), 2)
 
     cv2.putText(
@@ -116,26 +156,68 @@ def run(source, output_path=None, display=None, max_frames=None):
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    logger.info(
-        f"Source: {source} | native FPS: {fps:.2f} | total frames: {total_frames} "
-        f"| resizing every frame to {config.FRAME_WIDTH}x{config.FRAME_HEIGHT}"
+
+    # Read the actual first frame rather than trusting CAP_PROP_FRAME_WIDTH/
+    # HEIGHT (unreliable on some backends/RTSP streams) - frame.shape is
+    # ground truth for the real native size. This frame is then processed
+    # normally below, not discarded.
+    ret, first_frame = cap.read()
+    if not ret:
+        raise RuntimeError(f"Could not read any frames from source: {source}")
+    native_h, native_w = first_frame.shape[:2]
+
+    processing_w, processing_h = compute_processing_size(
+        native_w, native_h, config.PROCESSING_MAX_DIMENSION
     )
 
-    detector, tracker, line_counter, heatmap_gen = build_pipeline()
+    # Convert the config's fractional line geometry into concrete pixel
+    # coordinates for THIS run's processing size - never a hardcoded size.
+    line_start = (
+        config.LINE_START_FRACTION[0] * processing_w,
+        config.LINE_START_FRACTION[1] * processing_h,
+    )
+    line_end = (
+        config.LINE_END_FRACTION[0] * processing_w,
+        config.LINE_END_FRACTION[1] * processing_h,
+    )
+    line_margin = config.LINE_MARGIN_FRACTION * min(processing_w, processing_h)
+
+    logger.info(
+        f"Source: {source} | native FPS: {fps:.2f} | total frames: {total_frames} | "
+        f"native size: {native_w}x{native_h} -> processing size: {processing_w}x{processing_h} "
+        f"(aspect ratio preserved, max_dimension={config.PROCESSING_MAX_DIMENSION})"
+    )
+    logger.info(
+        f"Line geometry for this run: start={line_start} end={line_end} margin={line_margin:.1f}px"
+    )
+
+    detector, tracker, line_counter, heatmap_gen = build_pipeline(
+        line_start=line_start,
+        line_end=line_end,
+        line_margin=line_margin,
+        heatmap_width=processing_w,
+        heatmap_height=processing_h,
+    )
 
     writer = None
     if output_path:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (config.FRAME_WIDTH, config.FRAME_HEIGHT))
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (processing_w, processing_h))
 
     display_available = display
     frame_idx = 0
     processed_idx = 0
     start_time = time.time()
+    pending_frame = first_frame  # process the first frame we already read, then read() as normal
 
     try:
         while True:
-            ret, frame = cap.read()
+            if pending_frame is not None:
+                frame = pending_frame
+                pending_frame = None
+                ret = True
+            else:
+                ret, frame = cap.read()
             if not ret:
                 break
             frame_idx += 1
@@ -143,9 +225,12 @@ def run(source, output_path=None, display=None, max_frames=None):
                 break
 
             # Resize FIRST so detector, tracker, counter, and heatmap all
-            # operate in the exact same coordinate space (config.FRAME_WIDTH
-            # x config.FRAME_HEIGHT) regardless of the source's native size.
-            frame = cv2.resize(frame, (config.FRAME_WIDTH, config.FRAME_HEIGHT))
+            # operate in the exact same coordinate space (this run's
+            # aspect-ratio-preserving processing size). Because
+            # processing_w/processing_h were derived from this exact
+            # source's own aspect ratio, this resize only ever uniformly
+            # scales - it never stretches or distorts.
+            frame = cv2.resize(frame, (processing_w, processing_h))
 
             if (frame_idx - 1) % config.FRAME_SKIP != 0:
                 if writer is not None:
@@ -170,7 +255,7 @@ def run(source, output_path=None, display=None, max_frames=None):
             _log_to_database_stub(line_counter.get_stats())
 
             stats = line_counter.get_stats()
-            draw_overlay(frame, tracks, stats)
+            draw_overlay(frame, tracks, stats, line_start, line_end)
 
             if writer is not None:
                 writer.write(frame)
