@@ -37,6 +37,7 @@ from detector import PersonDetector
 from tracker import Tracker
 from counter import LineCounter
 from heatmap import HeatmapGenerator
+from queue_predictor import QueuePredictor
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +79,11 @@ def compute_processing_size(native_w: int, native_h: int, max_dimension: int) ->
     return processing_w, processing_h
 
 
-def build_pipeline(line_start, line_end, line_margin, heatmap_width, heatmap_height):
-    """Constructs the four pipeline stages. Detector/tracker come straight from
-    config.py; the counter's line and the heatmap's dimensions are passed in
-    because they depend on this run's runtime-computed processing size."""
+def build_pipeline(line_start, line_end, line_margin, heatmap_width, heatmap_height, queue_roi):
+    """Constructs the pipeline stages. Detector/tracker come straight from
+    config.py; the counter's line, the heatmap's dimensions, and the queue
+    ROI are passed in because they depend on this run's runtime-computed
+    processing size."""
     detector = PersonDetector(
         model_path=config.MODEL_PATH,
         conf_threshold=config.CONFIDENCE_THRESHOLD,
@@ -110,11 +112,20 @@ def build_pipeline(line_start, line_end, line_margin, heatmap_width, heatmap_hei
         point_radius=config.HEATMAP_POINT_RADIUS,
         decay_factor=config.HEATMAP_DECAY,
     )
-    return detector, tracker, line_counter, heatmap_gen
+    queue_predictor = None
+    if config.QUEUE_ENABLED:
+        queue_predictor = QueuePredictor(
+            roi=queue_roi,
+            arrival_window_seconds=config.QUEUE_ARRIVAL_WINDOW_SECONDS,
+            service_window_seconds=config.QUEUE_SERVICE_WINDOW_SECONDS,
+            min_service_rate=config.QUEUE_MIN_SERVICE_RATE,
+        )
+    return detector, tracker, line_counter, heatmap_gen, queue_predictor
 
 
-def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end):
-    """Draws track boxes/IDs, the counting line, and running stats onto frame (in place)."""
+def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end, queue_roi=None, queue_stats=None):
+    """Draws track boxes/IDs, the counting line, the queue ROI (if enabled),
+    and running stats onto frame (in place)."""
     for t in tracks:
         x1, y1, x2, y2 = [int(v) for v in t["bbox"]]
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -133,6 +144,19 @@ def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end):
         f"Occupancy: {line_counter_stats['occupancy']}",
         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
     )
+
+    if queue_roi is not None:
+        rx1, ry1, rx2, ry2 = [int(v) for v in queue_roi]
+        cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 200, 0), 2)
+
+    if queue_stats is not None:
+        wait = queue_stats["estimated_wait_seconds"]
+        wait_str = f"{wait:.0f}s" if wait is not None else "n/a"
+        cv2.putText(
+            frame,
+            f"Queue: {queue_stats['queue_length']}  Est. wait: {wait_str}",
+            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2,
+        )
     return frame
 
 
@@ -182,6 +206,12 @@ def run(source, output_path=None, display=None, max_frames=None):
     )
     line_margin = config.LINE_MARGIN_FRACTION * min(processing_w, processing_h)
 
+    # Convert the config's fractional queue ROI into concrete pixel
+    # coordinates for THIS run's processing size, same convention as the
+    # counting line above.
+    qx1, qy1, qx2, qy2 = config.QUEUE_ROI_FRACTION
+    queue_roi = (qx1 * processing_w, qy1 * processing_h, qx2 * processing_w, qy2 * processing_h)
+
     logger.info(
         f"Source: {source} | native FPS: {fps:.2f} | total frames: {total_frames} | "
         f"native size: {native_w}x{native_h} -> processing size: {processing_w}x{processing_h} "
@@ -191,12 +221,13 @@ def run(source, output_path=None, display=None, max_frames=None):
         f"Line geometry for this run: start={line_start} end={line_end} margin={line_margin:.1f}px"
     )
 
-    detector, tracker, line_counter, heatmap_gen = build_pipeline(
+    detector, tracker, line_counter, heatmap_gen, queue_predictor = build_pipeline(
         line_start=line_start,
         line_end=line_end,
         line_margin=line_margin,
         heatmap_width=processing_w,
         heatmap_height=processing_h,
+        queue_roi=queue_roi,
     )
 
     writer = None
@@ -207,6 +238,7 @@ def run(source, output_path=None, display=None, max_frames=None):
     display_available = display
     frame_idx = 0
     processed_idx = 0
+    queue_stats = None  # defensive default in case the loop is interrupted before any frame is processed
     start_time = time.time()
     pending_frame = first_frame  # process the first frame we already read, then read() as normal
 
@@ -241,6 +273,15 @@ def run(source, output_path=None, display=None, max_frames=None):
             detections = detector.detect(frame)
             tracks = tracker.update(detections)
             line_counter.update(tracks)
+
+            # Video-relative timestamp (frame_idx / native fps), not
+            # wall-clock time - keeps arrival/service rates meaningful
+            # whether a recorded file is processed slower or faster than
+            # real time, and matches wall-clock behavior for a live camera.
+            queue_stats = None
+            if queue_predictor is not None:
+                queue_stats = queue_predictor.update(tracks, frame_idx / fps)
+
             centroids = [
                 ((t["bbox"][0] + t["bbox"][2]) / 2.0, (t["bbox"][1] + t["bbox"][3]) / 2.0)
                 for t in tracks
@@ -255,7 +296,7 @@ def run(source, output_path=None, display=None, max_frames=None):
             _log_to_database_stub(line_counter.get_stats())
 
             stats = line_counter.get_stats()
-            draw_overlay(frame, tracks, stats, line_start, line_end)
+            draw_overlay(frame, tracks, stats, line_start, line_end, queue_roi=queue_roi, queue_stats=queue_stats)
 
             if writer is not None:
                 writer.write(frame)
@@ -273,7 +314,7 @@ def run(source, output_path=None, display=None, max_frames=None):
             if processed_idx % 100 == 0:
                 logger.info(
                     f"[frame {frame_idx}/{total_frames}] processed={processed_idx} "
-                    f"active_tracks={len(tracks)} stats={stats}"
+                    f"active_tracks={len(tracks)} stats={stats} queue_stats={queue_stats}"
                 )
     except KeyboardInterrupt:
         logger.info("Interrupted by user, shutting down cleanly.")
@@ -289,7 +330,7 @@ def run(source, output_path=None, display=None, max_frames=None):
     final_stats = line_counter.get_stats()
     logger.info(
         f"DONE. frames_read={frame_idx} frames_processed={processed_idx} "
-        f"elapsed={elapsed:.1f}s stats={final_stats}"
+        f"elapsed={elapsed:.1f}s stats={final_stats} final_queue_stats={queue_stats}"
     )
     return final_stats
 
