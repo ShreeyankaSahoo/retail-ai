@@ -15,7 +15,7 @@ HEATMAP_SAVE_PATH = os.path.join(BASE_DIR, "data", "heatmap.png")
 # ---------------------------------------------------------------------------
 # Detector (YOLOv8n)
 # ---------------------------------------------------------------------------
-CONFIDENCE_THRESHOLD = 0.4
+CONFIDENCE_THRESHOLD = 0.3       # validated during Phase 2 tracking tests
 IOU_THRESHOLD = 0.45
 PERSON_CLASS_ID = 0            # COCO class 0 == "person"
 INFERENCE_SIZE = 320            # 256/320/416 — lower = faster on RPi4 CPU
@@ -33,7 +33,7 @@ DISPLAY_WINDOW = True            # False for headless deployment (systemd servic
 # ---------------------------------------------------------------------------
 # Tracker (SORT-style, Kalman filter + IOU association)
 # ---------------------------------------------------------------------------
-MAX_TRACK_AGE = 30               # frames a lost track survives before deletion
+MAX_TRACK_AGE = 90               # frames a lost track survives before deletion (validated during Phase 2 tracking tests)
 MIN_HITS = 3                     # frames required before a track is "confirmed"
 IOU_MATCH_THRESHOLD = 0.3
 
