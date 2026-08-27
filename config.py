@@ -7,8 +7,8 @@ import os
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "yolov8n.pt")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "yolov8n.pt")
 DB_PATH = os.path.join(BASE_DIR, "data", "retail_ai.db")
 HEATMAP_SAVE_PATH = os.path.join(BASE_DIR, "data", "heatmap.png")
 
@@ -25,8 +25,8 @@ DEVICE = "cpu"                  # RPi4 has no CUDA GPU
 # Camera
 # ---------------------------------------------------------------------------
 CAMERA_SOURCE = "data/sample.mp4"                # 0 = default USB camera, or RTSP/file path
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
+FRAME_WIDTH = 474
+FRAME_HEIGHT = 850
 FRAME_SKIP = 2                   # run inference every Nth frame to save CPU
 DISPLAY_WINDOW = True            # False for headless deployment (systemd service)
 
