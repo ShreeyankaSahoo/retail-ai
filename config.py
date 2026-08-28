@@ -64,6 +64,19 @@ LINE_START_FRACTION = (0.0, 0.5)   # default: horizontal line across the frame's
 LINE_END_FRACTION = (1.0, 0.5)
 LINE_MARGIN_FRACTION = 0.015       # dead-zone as a fraction of min(processing_w, processing_h)
 
+# Whether the configured line above actually represents a calibrated
+# entrance/exit boundary for the CURRENT camera/footage. LineCounter always
+# runs and always produces entries/exits/occupancy numbers regardless of
+# this flag - they're mathematically correct crossings of whatever line is
+# configured - but those numbers are only a meaningful "footfall" measure
+# when the line has actually been placed on a real threshold for this scene
+# (see the Phase 2 line-placement calibration notes). Default test footage
+# and any camera view that hasn't been calibrated yet should set this False
+# so main.py's overlay/log clearly mark entries/exits as uncalibrated
+# instead of presenting them as authoritative. customers_present (below) is
+# unaffected by this flag - it never depended on the line to begin with.
+LINE_COUNTING_MEANINGFUL = True
+
 # ---------------------------------------------------------------------------
 # Queue prediction (Component 4, Tier 1 - Little's Law baseline)
 # ---------------------------------------------------------------------------
