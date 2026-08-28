@@ -123,9 +123,20 @@ def build_pipeline(line_start, line_end, line_margin, heatmap_width, heatmap_hei
     return detector, tracker, line_counter, heatmap_gen, queue_predictor
 
 
-def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end, queue_roi=None, queue_stats=None):
+def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end, customers_present,
+                  line_counting_meaningful=True, queue_roi=None, queue_stats=None):
     """Draws track boxes/IDs, the counting line, the queue ROI (if enabled),
-    and running stats onto frame (in place)."""
+    and running stats onto frame (in place).
+
+    customers_present (how many confirmed people the tracker currently sees)
+    is deliberately drawn on its own line, separate from the line-crossing
+    metrics below it - the two answer different questions ("how many people
+    are here right now" vs "net line crossings since the run started") and
+    are not interchangeable. See config.LINE_COUNTING_MEANINGFUL: when the
+    configured line hasn't been calibrated to a real entrance/exit for this
+    camera/footage, the line-based numbers are shown as uncalibrated rather
+    than presented as authoritative footfall figures.
+    """
     for t in tracks:
         x1, y1, x2, y2 = [int(v) for v in t["bbox"]]
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -138,11 +149,20 @@ def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end, queue_
     le = tuple(int(v) for v in line_end)
     cv2.line(frame, ls, le, (0, 0, 255), 2)
 
+    if line_counting_meaningful:
+        line_text = (
+            f"Entries: {line_counter_stats['entries']}  Exits: {line_counter_stats['exits']}  "
+            f"Net Occupancy (line-based): {line_counter_stats['occupancy']}"
+        )
+    else:
+        line_text = "Entries/Exits/Net Occupancy: NOT CALIBRATED for this camera/footage"
     cv2.putText(
-        frame,
-        f"Entries: {line_counter_stats['entries']}  Exits: {line_counter_stats['exits']}  "
-        f"Occupancy: {line_counter_stats['occupancy']}",
-        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+        frame, line_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+    )
+
+    cv2.putText(
+        frame, f"Customers present: {customers_present}",
+        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
     )
 
     if queue_roi is not None:
@@ -155,7 +175,7 @@ def draw_overlay(frame, tracks, line_counter_stats, line_start, line_end, queue_
         cv2.putText(
             frame,
             f"Queue: {queue_stats['queue_length']}  Est. wait: {wait_str}",
-            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2,
+            (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2,
         )
     return frame
 
@@ -274,6 +294,12 @@ def run(source, output_path=None, display=None, max_frames=None):
             tracks = tracker.update(detections)
             line_counter.update(tracks)
 
+            # How many confirmed people the tracker sees THIS frame - answers
+            # "how many customers are here right now", independent of the
+            # entrance/exit line entirely. Not the same thing as
+            # line_counter's occupancy (entries - exits); see draw_overlay().
+            customers_present = len(tracks)
+
             # Video-relative timestamp (frame_idx / native fps), not
             # wall-clock time - keeps arrival/service rates meaningful
             # whether a recorded file is processed slower or faster than
@@ -296,7 +322,11 @@ def run(source, output_path=None, display=None, max_frames=None):
             _log_to_database_stub(line_counter.get_stats())
 
             stats = line_counter.get_stats()
-            draw_overlay(frame, tracks, stats, line_start, line_end, queue_roi=queue_roi, queue_stats=queue_stats)
+            draw_overlay(
+                frame, tracks, stats, line_start, line_end, customers_present,
+                line_counting_meaningful=config.LINE_COUNTING_MEANINGFUL,
+                queue_roi=queue_roi, queue_stats=queue_stats,
+            )
 
             if writer is not None:
                 writer.write(frame)
